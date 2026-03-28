@@ -1,7 +1,7 @@
 """Kernel library for cuda-evolve.
 
 Each kernel module should export:
-  - KERNEL_TYPE: str           -- kernel identifier (must match bench.py KERNEL_CONFIGS)
+  - KERNEL_TYPE: str           -- kernel identifier (must match a config in kernel_configs/)
   - kernel_fn(**inputs) -> torch.Tensor (or tuple)
   - get_inputs() -> dict
   - get_flops() -> int  (optional, for roofline)
@@ -9,11 +9,11 @@ Each kernel module should export:
 
 Usage:
   cp kernels/<kernel_name>.py kernel.py   # select a kernel to optimize
-  uv run bench.py                         # benchmark it
+  uv run tools/bench.py                   # benchmark it
 
 To add a kernel, create a .py file in this directory implementing the interface
-above, then add a matching config in bench.py KERNEL_CONFIGS and a reference
-implementation in reference.py.
+above, then add a matching config pair in kernel_configs/ (<name>.toml + <name>.py)
+and a reference implementation in references/.
 """
 
 AVAILABLE_KERNELS: list[str] = [

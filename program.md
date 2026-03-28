@@ -18,11 +18,13 @@ kernels_optimized/              # Optimized versions (agent writes here)
 ```
 
 Each kernel module must export:
-- `KERNEL_TYPE: str` -- identifier matching a key in `tools/bench.py` `KERNEL_CONFIGS`
+- `KERNEL_TYPE: str` -- identifier matching a key in `kernel_configs/` (i.e. a `<name>.toml` + `<name>.py` pair)
 - `kernel_fn(**inputs) -> torch.Tensor` (or tuple)
 - `get_inputs() -> dict`
 - `get_flops() -> int` (for roofline analysis)
 - `get_bytes() -> int` (for roofline analysis)
+
+To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, tolerances) and `kernel_configs/<name>.py` (input_generator, reference_fn, flops_fn, bytes_fn). The registry auto-discovers them at import time.
 
 ## Setup Phase
 
@@ -295,6 +297,9 @@ Most kernels in this repo are memory-bound. The optimization priority for memory
 cuda-evolve/
 ├── kernels/                    # Baseline kernels (READ-ONLY)
 ├── kernels_optimized/          # Optimized kernels (agent saves here)
+├── kernel_configs/             # Per-kernel benchmark configs (TOML data + Python callables)
+│   ├── <name>.toml             # Sizes, dtypes, tolerances, edge_sizes
+│   └── <name>.py               # input_generator, reference_fn, flops_fn, bytes_fn
 ├── tools/                      # CLI scripts (bench, profile, NCU, run_loop, etc.)
 ├── references/                 # Per-kernel reference implementations (correctness spec; READ-ONLY)
 ├── workspace/                  # Working artifacts (results, memory summary, NCU exports)
@@ -313,6 +318,7 @@ cuda-evolve/
 
 - **`kernels/`**: Baseline kernels. **Never modify.** These are the starting point and comparison reference.
 - **`kernels_optimized/`**: Mirrors `kernels/` structure. The agent saves the best optimized version of each kernel here after finishing optimization.
+- **`kernel_configs/`**: Per-kernel benchmark configurations. Each kernel has a `.toml` file (declarative data: sizes, dtypes, tolerances) and a companion `.py` file (callables: input generator, reference wrapper, flops/bytes functions). Auto-discovered by `tools/bench.py` at import time. To add a new kernel, create `<name>.toml` + `<name>.py` here.
 - **`tools/`**: Runnable harnesses and helpers. Invoke with `uv run tools/<script>.py`.
 - **`references/`**: Per-kernel PyTorch reference code for correctness. **Never modify.**
 - **`CUDA_OPTIMIZATION.md`**: Grows over time as the agent discovers what works. Organized by kernel type with tagged entries (e.g., `[register-pressure]`, `[occupancy]`). Includes a "Cross-Kernel Optimization Patterns" section for transferable techniques.
