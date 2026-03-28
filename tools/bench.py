@@ -26,9 +26,11 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
+
+from kernel_configs import KERNEL_CONFIGS
 
 
 # ---------------------------------------------------------------------------
@@ -154,288 +156,7 @@ def detect_gpu() -> GPUSpec:
 
 
 # =========================================================================
-# 2. INPUT GENERATORS
-# =========================================================================
-
-def _dtype_bytes(dtype: torch.dtype) -> int:
-    return torch.tensor([], dtype=dtype).element_size()
-
-
-def gen_matmul_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N, K = size["M"], size["N"], size["K"]
-    a = torch.randn(M, K, device=device, dtype=dtype)
-    b = torch.randn(K, N, device=device, dtype=dtype)
-    return {"a": a, "b": b}
-
-
-def gen_rms_norm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    weight = torch.randn(N, device=device, dtype=dtype)
-    return {"x": x, "weight": weight}
-
-
-def gen_swiglu_input_quant_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    torch.manual_seed(seed)
-    M, N = size["M"], size["N"]
-    x = torch.randn(M, N * 2, dtype=dtype, device=device)
-    return {"x": x}
-
-
-def _ref_swiglu_input_quant(inputs: dict):
-    import references
-    return references.swiglu_input_quant_ref(inputs["x"])
-
-
-def gen_qkv_part_rope_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:  # noqa: ARG001
-    torch.manual_seed(seed)
-    batch = size["batch"]
-    seq_len = size["seq_len"]
-    q_heads = size["q_heads"]
-    kv_heads = size["kv_heads"]
-    head_dim = size["head_dim"]
-    nope_dim = size["nope_dim"]
-    num_heads = q_heads + 2 * kv_heads
-    rope_dim = head_dim - nope_dim
-
-    qkv = torch.randn(batch, seq_len, num_heads, head_dim,
-                       dtype=torch.bfloat16, device=device)
-    inv_freq = 1.0 / (
-        10000 ** (torch.arange(0, rope_dim, 2, device=device, dtype=torch.float32) / rope_dim)
-    )
-    t = torch.arange(seq_len, device=device, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
-
-    return {
-        "qkv": qkv, "cos": cos, "sin": sin,
-        "q_heads": q_heads, "kv_heads": kv_heads, "nope_dim": nope_dim,
-    }
-
-
-def gen_dsa_forward_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
-    import math as _math
-    torch.manual_seed(seed)
-    batch = size["batch"]
-    seq_len_q = size["seq_len_q"]
-    seq_len_kv = size["seq_len_kv"]
-    n_heads = size["n_heads"]
-    n_heads_kv = size["n_heads_kv"]
-    head_dim = size["head_dim"]
-    block_size = size["block_size"]
-
-    total_q = batch * seq_len_q
-    total_kv = batch * seq_len_kv
-    n_heads_block = n_heads_kv
-
-    q = torch.randn(total_q, n_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(total_kv, n_heads_kv, head_dim, dtype=dtype, device=device)
-    v = torch.randn(total_kv, n_heads_kv, head_dim, dtype=dtype, device=device)
-
-    cu_seqlens_q = torch.tensor(
-        [i * seq_len_q for i in range(batch + 1)], dtype=torch.int32, device=device
-    )
-    cu_seqlens_k = torch.tensor(
-        [i * seq_len_kv for i in range(batch + 1)], dtype=torch.int32, device=device
-    )
-    token2batch_q = torch.repeat_interleave(
-        torch.diff(cu_seqlens_q), output_size=total_q
-    )
-
-    num_kv_blocks = seq_len_kv // block_size
-    block_indices = torch.arange(num_kv_blocks, device=device, dtype=torch.int32)
-    block_indices = block_indices.unsqueeze(0).unsqueeze(0).expand(
-        total_q, n_heads_block, -1
-    ).contiguous()
-
-    scale = 1.0 / _math.sqrt(head_dim)
-
-    return {
-        "q": q, "k": k, "v": v,
-        "block_indices": block_indices,
-        "indices_blk_siz": block_size,
-        "scale": scale,
-        "cu_seqlens_q": cu_seqlens_q,
-        "cu_seqlens_k": cu_seqlens_k,
-        "token2batch_q": token2batch_q,
-    }
-
-
-# =========================================================================
-# 3. REFERENCE WRAPPERS
-# =========================================================================
-
-def _ref_matmul(inputs: dict) -> torch.Tensor:
-    import references
-    return references.matmul_ref(inputs["a"], inputs["b"])
-
-
-def _ref_rms_norm(inputs: dict) -> torch.Tensor:
-    import references
-    return references.rms_norm_ref(inputs["x"], inputs["weight"])
-
-
-def _ref_qkv_part_rope(inputs: dict) -> torch.Tensor:
-    import references
-    return references.qkv_part_rope_ref(**inputs)
-
-
-def _ref_dsa_forward(inputs: dict):
-    import references
-    return references.dsa_forward_ref(**inputs)
-
-
-# =========================================================================
-# 4. KERNEL CONFIGS
-# =========================================================================
-
-KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
-    # -----------------------------------------------------------------
-    # MATMUL
-    # -----------------------------------------------------------------
-    "matmul": {
-        "test_sizes": [
-            ("tiny",    {"M": 128,  "N": 128,  "K": 128}),
-            ("small",   {"M": 512,  "N": 512,  "K": 512}),
-            ("medium",  {"M": 1024, "N": 1024, "K": 1024}),
-            ("large",   {"M": 2048, "N": 2048, "K": 2048}),
-            ("xlarge",  {"M": 4096, "N": 4096, "K": 4096}),
-            ("tall",    {"M": 8192, "N": 1024, "K": 1024}),
-            ("wide",    {"M": 1024, "N": 8192, "K": 1024}),
-            ("deep_k",  {"M": 1024, "N": 1024, "K": 8192}),
-            ("llm_qkv", {"M": 4096, "N": 4096, "K": 512}),
-            ("llm_mlp", {"M": 4096, "N": 11008, "K": 4096}),
-        ],
-        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
-            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
-        },
-        "flops_fn": lambda s: 2 * s["M"] * s["N"] * s["K"],
-        "bytes_fn": lambda s, dt: (s["M"] * s["K"] + s["K"] * s["N"] + s["M"] * s["N"]) * _dtype_bytes(dt),
-        "input_generator": gen_matmul_inputs,
-        "reference_fn": _ref_matmul,
-        "edge_sizes": [
-            ("edge_1023",  {"M": 1023, "N": 1023, "K": 1023}),
-            ("edge_4097",  {"M": 4097, "N": 4097, "K": 512}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # RMS NORM
-    # -----------------------------------------------------------------
-    "rms_norm": {
-        "test_sizes": [
-            ("tiny",    {"M": 32,    "N": 128}),
-            ("small",   {"M": 256,   "N": 768}),
-            ("medium",  {"M": 1024,  "N": 1024}),
-            ("large",   {"M": 4096,  "N": 4096}),
-            ("llm_7b",  {"M": 2048,  "N": 4096}),
-            ("llm_13b", {"M": 2048,  "N": 5120}),
-        ],
-        "test_dtypes": [torch.bfloat16, torch.float16],
-        "tolerances": {
-            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
-            torch.bfloat16: {"atol": 1e-1, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: 6 * s["M"] * s["N"],
-        "bytes_fn": lambda s, dt: (2 * s["M"] * s["N"] + s["N"]) * _dtype_bytes(dt),
-        "input_generator": gen_rms_norm_inputs,
-        "reference_fn": _ref_rms_norm,
-        "edge_sizes": [
-            ("edge_1023", {"M": 1023, "N": 768}),
-            ("edge_4097", {"M": 4097, "N": 1024}),
-        ],
-    },
-
-    # -----------------------------------------------------------------
-    # SWIGLU + INPUT FP8 QUANTIZATION
-    # -----------------------------------------------------------------
-    "swiglu_input_quant": {
-        "multi_output": True,
-        "test_sizes": [
-            ("small",   {"M": 256,  "N": 1024}),
-            ("medium",  {"M": 1024, "N": 3584}),
-            ("large",   {"M": 4096, "N": 7168}),
-        ],
-        "test_dtypes": [torch.bfloat16],
-        "tolerances": {
-            torch.bfloat16: {"atol": 5e-1, "rtol": 5e-1},
-        },
-        "flops_fn": lambda s: 13 * s["M"] * s["N"],
-        "bytes_fn": lambda s, dt: (
-            s["M"] * s["N"] * 2 * _dtype_bytes(dt)
-            + s["M"] * s["N"] * _dtype_bytes(dt)
-            + s["M"] * s["N"] * 2 * 1
-            + (s["N"] * 2 // 128) * s["M"] * 4
-        ),
-        "input_generator": gen_swiglu_input_quant_inputs,
-        "reference_fn": _ref_swiglu_input_quant,
-        "edge_sizes": [],
-    },
-
-    # -----------------------------------------------------------------
-    # QKV PART ROPE
-    # -----------------------------------------------------------------
-    "qkv_part_rope": {
-        "test_sizes": [
-            ("small",   {"batch": 1, "seq_len": 2048, "q_heads": 10, "kv_heads": 1, "head_dim": 256, "nope_dim": 192}),
-            ("medium",  {"batch": 2, "seq_len": 2048, "q_heads": 10, "kv_heads": 1, "head_dim": 256, "nope_dim": 192}),
-            ("large",   {"batch": 2, "seq_len": 4096, "q_heads": 10, "kv_heads": 1, "head_dim": 256, "nope_dim": 192}),
-            ("xlarge",  {"batch": 4, "seq_len": 4096, "q_heads": 10, "kv_heads": 1, "head_dim": 256, "nope_dim": 192}),
-            ("batch50", {"batch": 50, "seq_len": 2048, "q_heads": 10, "kv_heads": 1, "head_dim": 256, "nope_dim": 192}),
-        ],
-        "test_dtypes": [torch.bfloat16],
-        "tolerances": {
-            torch.bfloat16: {"atol": 1e-2, "rtol": 1e-2},
-        },
-        "flops_fn": lambda s: s["batch"] * s["seq_len"] * (s["q_heads"] + s["kv_heads"]) * (s["head_dim"] - s["nope_dim"]) * 6,
-        "bytes_fn": lambda s, dt: (
-            s["batch"] * s["seq_len"] * (s["q_heads"] + 2 * s["kv_heads"]) * s["head_dim"] * 2 * 2
-            + s["seq_len"] * ((s["head_dim"] - s["nope_dim"]) // 2) * 4 * 2
-        ),
-        "input_generator": gen_qkv_part_rope_inputs,
-        "reference_fn": _ref_qkv_part_rope,
-        "edge_sizes": [],
-    },
-
-    # -----------------------------------------------------------------
-    # DSA FORWARD (Dynamic Sparse Attention)
-    # -----------------------------------------------------------------
-    "dsa_forward": {
-        "multi_output": True,
-        "test_sizes": [
-            ("tiny",   {"batch": 1, "seq_len_q": 128,  "seq_len_kv": 128,  "n_heads": 32, "n_heads_kv": 8, "head_dim": 128, "block_size": 64}),
-            ("small",  {"batch": 2, "seq_len_q": 512,  "seq_len_kv": 512,  "n_heads": 32, "n_heads_kv": 8, "head_dim": 128, "block_size": 64}),
-            ("medium", {"batch": 4, "seq_len_q": 1024, "seq_len_kv": 1024, "n_heads": 32, "n_heads_kv": 8, "head_dim": 128, "block_size": 64}),
-            ("large",  {"batch": 4, "seq_len_q": 2048, "seq_len_kv": 2048, "n_heads": 32, "n_heads_kv": 8, "head_dim": 128, "block_size": 64}),
-        ],
-        "test_dtypes": [torch.bfloat16],
-        "tolerances": {
-            torch.bfloat16: {"atol": 5e-2, "rtol": 5e-2},
-        },
-        "flops_fn": lambda s: s["batch"] * s["seq_len_q"] * s["n_heads"] * (
-            2 * s["seq_len_kv"] * s["head_dim"] + 2 * s["seq_len_kv"] * s["head_dim"]
-        ),
-        "bytes_fn": lambda s, dt: (
-            s["batch"] * s["seq_len_q"] * s["n_heads"] * s["head_dim"] * _dtype_bytes(dt)
-            + s["batch"] * s["seq_len_kv"] * s["n_heads_kv"] * s["head_dim"] * _dtype_bytes(dt) * 2
-            + s["batch"] * s["seq_len_q"] * s["n_heads"] * s["head_dim"] * _dtype_bytes(dt)
-            + s["batch"] * s["seq_len_q"] * s["n_heads"] * 4
-        ),
-        "input_generator": gen_dsa_forward_inputs,
-        "reference_fn": _ref_dsa_forward,
-        "edge_sizes": [],
-    },
-}
-
-
-# =========================================================================
-# 5. CORRECTNESS TESTING (5 stages)
+# 2. CORRECTNESS TESTING (5 stages)
 # =========================================================================
 
 def _compare(output: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> dict:
@@ -838,7 +559,7 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
 
 
 # =========================================================================
-# 6. PERFORMANCE BENCHMARKING
+# 3. PERFORMANCE BENCHMARKING
 # =========================================================================
 
 def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
@@ -991,7 +712,7 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
 
 # =========================================================================
-# 7. PROFILER (optional)
+# 4. PROFILER (optional)
 # =========================================================================
 
 def run_profile(kernel_fn: Callable, config: dict):
@@ -1042,7 +763,7 @@ def run_profile(kernel_fn: Callable, config: dict):
 
 
 # =========================================================================
-# 8. MAIN
+# 5. MAIN
 # =========================================================================
 
 def main():
