@@ -256,6 +256,79 @@ cuda-evolve/
 - **`memory/<kernel_type>.md`**: Detailed per-kernel experiment log with full NCU analysis, hypotheses, and outcomes. This is the primary record for each kernel.
 - **`MEMORY.md`**: High-level cross-kernel summary. Kept concise — just the current best results and transferable insights.
 
+## Multi-Agent Parallel Optimization
+
+When multiple agents need to optimize **different kernels** simultaneously, use **git worktree** to give each agent an isolated working directory. This avoids conflicts on `kernel.py`, logs, git state, and GPU resources.
+
+### Setup
+
+From the main repository, create one worktree per kernel/agent:
+
+```bash
+# Ensure main is clean
+git checkout main
+
+# Create isolated worktrees (one per kernel)
+git worktree add ../cuda-evolve-matmul   -b agent/matmul
+git worktree add ../cuda-evolve-rms-norm -b agent/rms-norm
+git worktree add ../cuda-evolve-swiglu   -b agent/swiglu
+```
+
+Each worktree is an independent directory with its own `kernel.py`, `results.tsv`, `MEMORY.md`, `memory/`, `traces/`, and git working state. All worktrees share the same `.git` repository, so commit history is unified and branches can be merged.
+
+### Branch Naming Convention
+
+Use `agent/<kernel_name>` branches (e.g. `agent/matmul`, `agent/rms-norm`). Each agent commits only to its own branch.
+
+### GPU Isolation
+
+Bind each agent to a separate GPU via `CUDA_VISIBLE_DEVICES`:
+
+```bash
+# Agent A (matmul) — GPU 0
+cd ../cuda-evolve-matmul
+CUDA_VISIBLE_DEVICES=0 uv run bench.py > run.log 2>&1
+
+# Agent B (rms_norm) — GPU 1
+cd ../cuda-evolve-rms-norm
+CUDA_VISIBLE_DEVICES=1 uv run bench.py > run.log 2>&1
+```
+
+If only **one GPU** is available, agents can edit code in parallel but must **serialize benchmark execution** to avoid VRAM contention and timing interference.
+
+### Per-Agent Workflow
+
+Each agent follows the standard Experiment Loop (above) inside its own worktree. No changes to the loop itself — the isolation is at the directory/branch level.
+
+### Merging Results Back to Main
+
+After each agent completes optimization, merge its branch into `main`:
+
+```bash
+cd /path/to/main-repo
+git merge agent/matmul   --no-ff -m "merge: matmul optimization results"
+git merge agent/rms-norm --no-ff -m "merge: rms-norm optimization results"
+```
+
+**Conflict expectations by file:**
+
+| File | Conflict risk | Resolution |
+|------|--------------|------------|
+| `kernels_optimized/<name>.py` | None — different files | Auto-merge |
+| `memory/<kernel_type>.md` | None — different files | Auto-merge |
+| `results.tsv` | Low — append-only | Concatenate rows (keep header once) |
+| `MEMORY.md` | Low — different sections | Merge by section |
+| `CUDA_OPTIMIZATION.md` | Low — different kernel type sections | Merge by section |
+
+You can use `merge_results.py` to assist with `results.tsv` merging (see below).
+
+### Cleanup
+
+```bash
+git worktree remove ../cuda-evolve-matmul
+git worktree remove ../cuda-evolve-rms-norm
+```
+
 ## Important Rules
 
 1. **Never break correctness.** Every change must pass all 5 correctness stages.

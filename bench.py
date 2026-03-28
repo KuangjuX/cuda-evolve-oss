@@ -1010,7 +1010,7 @@ def run_profile(kernel_fn: Callable, config: dict):
     dtype = config["test_dtypes"][0]
     inputs = gen_fn(prof_size, dtype, device, seed=42)
 
-    trace_dir = "./traces"
+    trace_dir = os.environ.get("CUDA_EVOLVE_TRACE_DIR", "./traces")
     os.makedirs(trace_dir, exist_ok=True)
 
     print("\n=== PROFILING ===")
