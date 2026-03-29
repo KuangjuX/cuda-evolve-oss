@@ -97,7 +97,11 @@ def _find_ncu() -> str | None:
 
 
 def _get_kernel_launch_cmd(kernel_file: str) -> list[str]:
-    """Build the python command that launches the kernel once for profiling."""
+    """Build the python command that launches the kernel once for profiling.
+
+    Uses kernel_configs for input generation (same path as bench.py) so that
+    profiling inputs are consistent with benchmark inputs.
+    """
     return [
         sys.executable, "-c",
         f"""
@@ -108,8 +112,35 @@ if {os.getcwd()!r} not in sys.path:
 spec = importlib.util.spec_from_file_location("kernel_mod", {kernel_file!r})
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-inputs = mod.get_inputs()
-import torch; torch.cuda.synchronize()
+
+import torch
+
+kernel_type = getattr(mod, "KERNEL_TYPE", None)
+if not kernel_type:
+    raise RuntimeError(
+        f"kernel module {{spec.origin}} has no KERNEL_TYPE attribute"
+    )
+
+from kernel_configs import KERNEL_CONFIGS
+cfg = KERNEL_CONFIGS.get(kernel_type)
+if cfg is None:
+    raise RuntimeError(
+        f"KERNEL_TYPE '{{kernel_type}}' not found in kernel_configs. "
+        f"Available: {{', '.join(KERNEL_CONFIGS.keys())}}"
+    )
+
+sizes = cfg["test_sizes"]
+size = None
+for label, sz in sizes:
+    if label == "large":
+        size = sz
+        break
+if size is None:
+    size = sizes[-1][1]
+dtype = cfg["test_dtypes"][0]
+inputs = cfg["input_generator"](size, dtype, "cuda", seed=42)
+
+torch.cuda.synchronize()
 for _ in range(3):
     mod.kernel_fn(**inputs)
 torch.cuda.synchronize()
@@ -497,7 +528,7 @@ def main():
     metrics = collect_metrics(skills)
     print(f"metrics_count: {len(metrics)}")
 
-    trace_dir = os.environ.get("CUDA_EVOLVE_TRACE_DIR", "./traces")
+    trace_dir = os.environ.get("CUDA_EVOLVE_TRACE_DIR", "./workspace/ncu_reports")
     os.makedirs(trace_dir, exist_ok=True)
 
     csv_name = args.save if args.save else "ncu_profile"
