@@ -311,6 +311,7 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
     sweep_pass = True
     sweep_count = 0
     sweep_fail_count = 0
+    sweep_run_count = 0
     worst_error = 0.0
     worst_case = ""
 
@@ -322,6 +323,8 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
                 expected = ref_fn(inputs)
                 with _Timeout(30):
                     output = kernel_fn(**inputs)
+
+                sweep_run_count += 1
 
                 if _has_nan_inf(output):
                     sweep_pass = False
@@ -362,9 +365,13 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
             finally:
                 torch.cuda.empty_cache()
 
-    if sweep_pass:
-        results["shape_sweep"] = f"PASS ({sweep_count} configs, worst_err={worst_error:.2e} at {worst_case})"
-        print(f"  shape_sweep: PASS ({sweep_count} configs, worst_err={worst_error:.2e})")
+    if sweep_run_count == 0:
+        results["shape_sweep"] = f"FAIL (0/{sweep_count} configs ran — all skipped due to OOM)"
+        all_pass = False
+        print(f"  shape_sweep: FAIL (0/{sweep_count} configs ran — all skipped due to OOM)")
+    elif sweep_pass:
+        results["shape_sweep"] = f"PASS ({sweep_run_count}/{sweep_count} configs, worst_err={worst_error:.2e} at {worst_case})"
+        print(f"  shape_sweep: PASS ({sweep_run_count}/{sweep_count} configs, worst_err={worst_error:.2e})")
     else:
         results["shape_sweep"] = f"FAIL ({sweep_fail_count}/{sweep_count} failed)"
         all_pass = False
@@ -562,6 +569,15 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
 # 3. PERFORMANCE BENCHMARKING
 # =========================================================================
 
+def _peak_tflops_for_dtype(gpu: GPUSpec, dtype: torch.dtype) -> float:
+    """Return the GPU's peak TFLOPS for the given dtype."""
+    if dtype in (torch.float32, torch.float64):
+        return gpu.peak_tflops_fp32
+    if dtype == torch.bfloat16:
+        return gpu.peak_tflops_bf16
+    return gpu.peak_tflops_fp16
+
+
 def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     """Benchmark a function and return median time in milliseconds."""
     try:
@@ -650,16 +666,17 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
             bandwidth_gb_s = nbytes / (kernel_ms / 1000.0) / 1e9 if kernel_ms > 0 else 0.0
             ref_throughput_tflops = flops / (ref_ms / 1000.0) / 1e12 if ref_ms > 0 else 0.0
 
+            peak_tflops = _peak_tflops_for_dtype(gpu, dtype)
             arithmetic_intensity = flops / nbytes if nbytes > 0 else 0.0
-            ridge_point = (gpu.peak_tflops_fp16 * 1e12) / (gpu.peak_bandwidth_gb_s * 1e9) if gpu.peak_bandwidth_gb_s > 0 else 0.0
+            ridge_point = (peak_tflops * 1e12) / (gpu.peak_bandwidth_gb_s * 1e9) if gpu.peak_bandwidth_gb_s > 0 else 0.0
 
             if arithmetic_intensity < ridge_point:
                 bottleneck = "memory_bound"
                 pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
-                pct_peak_compute = (throughput_tflops / gpu.peak_tflops_fp16 * 100.0) if gpu.peak_tflops_fp16 > 0 else 0.0
+                pct_peak_compute = (throughput_tflops / peak_tflops * 100.0) if peak_tflops > 0 else 0.0
             else:
                 bottleneck = "compute_bound"
-                pct_peak_compute = (throughput_tflops / gpu.peak_tflops_fp16 * 100.0) if gpu.peak_tflops_fp16 > 0 else 0.0
+                pct_peak_compute = (throughput_tflops / peak_tflops * 100.0) if peak_tflops > 0 else 0.0
                 pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
 
             speedup = ref_ms / kernel_ms if kernel_ms > 0 else 0.0
