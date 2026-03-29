@@ -70,27 +70,10 @@ For quick iteration (skip numerical stability, determinism, edge cases):
 uv run tools/bench.py --quick > run.log 2>&1
 ```
 
-Read `run.log` and extract the key metrics. Use `tools/summarize.py` for a compact summary (saves context tokens):
-
-```bash
-uv run tools/summarize.py                # compact bench summary (~10 lines)
-uv run tools/summarize.py --ncu          # include NCU data if ncu.log exists
-uv run tools/summarize.py --json         # machine-readable JSON format
-```
-
-Or extract individual metrics with grep:
+Read `run.log` and extract the key metrics:
 
 ```bash
 grep "correctness\|throughput_tflops\|speedup_vs_pytorch\|pct_peak_compute\|pct_peak_bandwidth\|bottleneck\|peak_vram_mb" run.log
-```
-
-To review experiment history compactly (instead of reading full `workspace/results.tsv`):
-
-```bash
-uv run tools/history.py                  # last 10 experiments in table format
-uv run tools/history.py --last 5         # last 5 experiments
-uv run tools/history.py --trajectory     # throughput over time visualization
-uv run tools/history.py --kept-only      # only successful experiments
 ```
 
 The benchmark reports:
@@ -156,12 +139,7 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 1. **Macro**: `tools/bench.py` roofline → is it compute-bound or memory-bound? How far from peak?
 2. **Micro**: `ncu-cli analyze` → what is the *specific* bottleneck? (stall type, cache miss, uncoalesced access, etc.)
 3. **Knowledge**: Check `CUDA_OPTIMIZATION.md` → does a known optimization address this? The "Cross-Kernel Optimization Patterns" section at the bottom organizes techniques by bottleneck type (e.g., `[register-pressure]`, `[occupancy]`, `[tensor-core]`) for easy lookup regardless of which kernel you're optimizing.
-4. **Docs**: Query the reference docs for the specific bottleneck:
-   ```bash
-   uv run tools/retrieve_docs.py "long scoreboard stall mitigation"
-   uv run tools/retrieve_docs.py "register pressure reduction"
-   ```
-   The `docs/` directory contains curated references on stall reasons, memory optimization, compute optimization, and architecture-specific notes.
+4. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, memory optimization, compute optimization, and architecture-specific notes.
 5. **History**: Check `memory/<kernel_type>.md` → has this been tried before for this kernel?
 
 **Rules:**
@@ -238,34 +216,11 @@ When an optimization **succeeds**, add it to `CUDA_OPTIMIZATION.md` under the ap
 - Expected speedup range
 - When an optimization **fails**, add it to the "Anti-patterns" section for that kernel type.
 
-### Step 10: Supervisor Check
-
-Every 3-5 experiments, run the supervisor to check your optimization trajectory:
-
-```bash
-uv run tools/supervisor.py --kernel-type <kernel_type> > supervisor.log 2>&1
-```
-
-Extract the directive:
-
-```bash
-grep "supervisor_status\|supervisor_finding\|supervisor_suggestion\|supervisor_avoided" supervisor.log
-```
-
-| Status | Action |
-|--------|--------|
-| `progressing` | Continue current optimization direction |
-| `stagnating` | Read supervisor suggestions, pivot to a different optimization category |
-| `stuck` | Review full experiment history, revert to best known state, try qualitatively different approach |
-
-The supervisor detects: throughput plateaus, repeated failed categories, oscillation, and high failure rates. Follow its suggestions to avoid wasting cycles on exhausted directions.
-
-### Step 11: Repeat
+### Step 10: Repeat
 
 Return to Step 1. Continue until:
 - Performance gains have plateaued (< 1% improvement over 3 consecutive experiments)
 - You have exhausted all known optimizations in `CUDA_OPTIMIZATION.md` and cannot generate new hypotheses from NCU data
-- The supervisor reports `stuck` and you have tried all suggested pivot directions
 
 ## Switching Kernels
 
@@ -346,7 +301,7 @@ cuda-evolve/
 - **`CUDA_OPTIMIZATION.md`**: Grows over time as the agent discovers what works. Organized by kernel type with tagged entries (e.g., `[register-pressure]`, `[occupancy]`). Includes a "Cross-Kernel Optimization Patterns" section for transferable techniques.
 - **`memory/<kernel_type>.md`**: Detailed per-kernel experiment log with full NCU analysis, hypotheses, and outcomes. This is the primary record for each kernel.
 - **`workspace/MEMORY.md`**: High-level cross-kernel summary. Kept concise — just the current best results and transferable insights.
-- **`docs/`**: Curated reference documentation on GPU optimization. **Never modify.** Searchable via `tools/retrieve_docs.py`.
+- **`docs/`**: Curated reference documentation on GPU optimization. **Never modify.** Read the relevant files directly when investigating a specific bottleneck.
 - **`workspace/results.tsv`**: Extended schema with NCU micro-metrics, git SHA, parent experiment lineage, and bottleneck classification.
 - **`workspace/ncu_reports/`**: Directory for NCU profiling exports and related artifacts.
 
@@ -356,12 +311,7 @@ cuda-evolve/
 |------|---------|-------|
 | `tools/bench.py` | Correctness + performance benchmark | `uv run tools/bench.py > run.log 2>&1` |
 | `tools/ncu_profile.py` | NCU micro-architecture profiling | `uv run tools/ncu_profile.py > ncu.log 2>&1` |
-| `tools/profile.py` | Quick timing + roofline | `uv run tools/profile.py` |
 | `tools/run_loop.py` | Automated experiment cycle | `uv run tools/run_loop.py --hypothesis "..."` |
-| `tools/supervisor.py` | Stagnation detection + strategy pivot | `uv run tools/supervisor.py` |
-| `tools/summarize.py` | Compact log summary | `uv run tools/summarize.py` |
-| `tools/history.py` | Experiment history table | `uv run tools/history.py --last 10` |
-| `tools/retrieve_docs.py` | Search reference docs | `uv run tools/retrieve_docs.py "query"` |
 | `tools/prepare.py` | Environment validation | `uv run tools/prepare.py` |
 | `tools/merge_results.py` | Merge multi-agent results | `uv run tools/merge_results.py ../worktree` |
 

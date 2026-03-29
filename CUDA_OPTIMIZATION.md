@@ -2,7 +2,7 @@
 
 This document is **maintained by the optimization agent**. As kernels are optimized, the agent summarizes effective optimization strategies here, organized by kernel type and by cross-kernel pattern. This serves as a growing knowledge base for future optimization runs.
 
-Use `uv run tools/retrieve_docs.py "<bottleneck>"` to search this file and the `docs/` reference library for relevant optimization techniques.
+When investigating a specific bottleneck, read the relevant files in `docs/` directly (e.g. `docs/stall_reasons.md`, `docs/memory_optimization.md`, `docs/compute_optimization.md`, `docs/arch_notes.md`).
 
 ---
 
