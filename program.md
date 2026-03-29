@@ -11,18 +11,24 @@ Optimized kernels are saved to `kernels_optimized/`, which mirrors the structure
 **Directory layout:**
 ```
 kernels/                        # Baseline (READ-ONLY, never modify)
-└── <your_kernel>.py            # Add your kernels here
+├── <your_kernel>.py            # Python module (Triton or wrapper)
+└── <your_kernel>.cu            # Optional: CUDA C source (paired with .py wrapper)
 
 kernels_optimized/              # Optimized versions (agent writes here)
-└── <your_kernel>.py
+├── <your_kernel>.py
+└── <your_kernel>.cu            # If the kernel uses CUDA C
 ```
 
-Each kernel module must export:
+Each kernel module (`.py`) must export:
 - `KERNEL_TYPE: str` -- identifier matching a key in `kernel_configs/` (i.e. a `<name>.toml` + `<name>.py` pair)
 - `kernel_fn(**inputs) -> torch.Tensor` (or tuple)
 - `get_inputs() -> dict`
 - `get_flops() -> int` (for roofline analysis)
 - `get_bytes() -> int` (for roofline analysis)
+
+**Kernel types:**
+- **Triton kernels**: Single `.py` file containing Triton code directly
+- **CUDA C kernels**: A `.py` wrapper that compiles and loads a companion `.cu` file via `torch.utils.cpp_extension.load_inline()`
 
 To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, tolerances) and `kernel_configs/<name>.py` (input_generator, reference_fn, flops_fn, bytes_fn). The registry auto-discovers them at import time.
 
@@ -38,6 +44,9 @@ To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, toleran
 
    # Resuming: start from last optimized version (if it exists)
    cp kernels_optimized/<your_kernel>.py kernel.py
+
+   # For CUDA C kernels, also copy the .cu file:
+   cp kernels/<your_kernel>.cu kernel.cu    # if it exists
    ```
 5. Read the per-kernel log in `memory/<kernel_type>.md` if it exists, to review past experiments for this specific kernel.
 6. Read `kernel.py` to understand the current kernel implementation.
@@ -162,12 +171,17 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 
 ### Step 5: Modify
 
-Edit `kernel.py` to implement your hypothesis.
+Edit `kernel.py` (and `kernel.cu` for CUDA C kernels) to implement your hypothesis.
 
 ### Step 6: Commit
 
 ```bash
+# Triton kernels:
 git add kernel.py
+git commit -m "experiment: <brief description of change>"
+
+# CUDA C kernels (when kernel.cu exists):
+git add kernel.py kernel.cu
 git commit -m "experiment: <brief description of change>"
 ```
 
@@ -183,7 +197,7 @@ uv run tools/bench.py > run.log 2>&1
 
 | Condition | Action |
 |-----------|--------|
-| correctness = FAIL | **REVERT** immediately: `git reset --hard HEAD~1` |
+| correctness = FAIL | **REVERT** immediately: `git reset --hard HEAD~1` (reverts both `kernel.py` and `kernel.cu`) |
 | correctness = PASS, throughput improved (>1%) | **KEEP** |
 | correctness = PASS, throughput same or worse | **REVERT**: `git reset --hard HEAD~1` |
 
@@ -260,9 +274,11 @@ When you finish optimizing one kernel, save the optimized version to `kernels_op
 ```bash
 # Save optimized kernel
 cp kernel.py kernels_optimized/<kernel_name>.py
+cp kernel.cu kernels_optimized/<kernel_name>.cu    # if CUDA C kernel
 
 # Switch to next kernel -- copy from baseline (or from kernels_optimized/ if resuming)
 cp kernels/<next_kernel>.py kernel.py
+cp kernels/<next_kernel>.cu kernel.cu              # if CUDA C kernel
 
 # Per-kernel logs are in memory/<kernel_type>.md -- they persist across sessions
 # workspace/MEMORY.md has the global summary -- cross-kernel insights are valuable
@@ -296,16 +312,22 @@ Most kernels in this repo are memory-bound. The optimization priority for memory
 ```
 cuda-evolve/
 ├── kernels/                    # Baseline kernels (READ-ONLY)
+│   ├── <name>.py               # Python module (Triton or CUDA C wrapper)
+│   └── <name>.cu               # Optional: CUDA C source (paired with .py)
 ├── kernels_optimized/          # Optimized kernels (agent saves here)
+│   ├── <name>.py
+│   └── <name>.cu               # If CUDA C kernel
 ├── kernel_configs/             # Per-kernel benchmark configs (TOML data + Python callables)
 │   ├── <name>.toml             # Sizes, dtypes, tolerances, edge_sizes
 │   └── <name>.py               # input_generator, reference_fn, flops_fn, bytes_fn
-├── tools/                      # CLI scripts (bench, profile, NCU, run_loop, etc.)
+├── tools/                      # CLI scripts (bench, NCU, run_loop, prepare, merge)
 ├── references/                 # Per-kernel reference implementations (correctness spec; READ-ONLY)
 ├── workspace/                  # Working artifacts (results, memory summary, NCU exports)
 │   ├── MEMORY.md               # Global summary across all kernels
 │   ├── results.tsv             # Raw experiment results (extended schema with NCU metrics, lineage)
 │   └── ncu_reports/            # NCU report outputs
+├── kernel.py                   # Current working kernel module
+├── kernel.cu                   # Current working CUDA C source (when applicable)
 ├── CUDA_OPTIMIZATION.md        # Agent-maintained: optimization patterns by kernel type + cross-kernel patterns
 ├── memory/
 │   └── <kernel_type>.md        # Detailed experiment log per kernel
